@@ -23,7 +23,7 @@ function settings() {
     return cfg;
 }
 function persist() { getContext().saveSettingsDebounced(); }
-function escapeRegex(value) { return String(value).replace(/[.*+?^\${}()|[\]\\]/g, '\\$&'); }
+function escapeRegex(value) { return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 function simplePattern(source) {
     let out = '';
@@ -74,7 +74,7 @@ function pickReplacement(values) {
 }
 function replacementText(template, args) {
     const captures = args.slice(1, -2);
-    return String(template ?? '').replace(/\\$(\\d{1,2})/g, (_, n) => captures[Number(n) - 1] ?? '');
+    return String(template ?? '').replace(/\$(\d{1,2})/g, (_, n) => captures[Number(n) - 1] ?? '');
 }
 function applyText(source, processors) {
     let text = source, count = 0;
@@ -97,7 +97,7 @@ function tagEnd(source, start) {
 function cleanHtml(html, cfg) {
     const source = String(html ?? ''), processors = buildProcessors(cfg);
     if (!source || !processors.length) return { text: source, count: 0 };
-    const scopes = String(cfg.scopeTags || '').toLowerCase().split(/[\\s,，]+/).map(x => x.replace(/[<>/]/g, '')).filter(Boolean);
+    const scopes = String(cfg.scopeTags || '').toLowerCase().split(/[\s,，]+/).map(x => x.replace(/[<>/]/g, '')).filter(Boolean);
     const raw = new Set(['script', 'style', 'textarea', 'pre', 'code']);
     const stack = [];
     let output = '', count = 0, cursor = 0;
@@ -116,10 +116,10 @@ function cleanHtml(html, cfg) {
         }
         const end = tagEnd(source, open), token = source.slice(open, end);
         output += token;
-        const m = token.match(/^<\\s*(\\/?)\\s*([a-zA-Z][\\w:-]*)\\b/);
+        const m = token.match(/^<\s*(\/?)\s*([a-zA-Z][\w:-]*)\b/);
         if (m) {
             const closing = !!m[1], tag = m[2].toLowerCase();
-            const empty = /\\/\\s*>$/.test(token) || /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag);
+            const empty = /\/\s*>$/.test(token) || /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag);
             if (closing) { const i = stack.lastIndexOf(tag); if (i >= 0) stack.splice(i); }
             else if (!empty) stack.push(tag);
         }
@@ -142,12 +142,12 @@ function mountPanel() {
     if (document.getElementById('str-panel')) return;
     const host = document.querySelector('#extensions_settings'); if (!host) return;
     const panel = document.createElement('section'); panel.id = 'str-panel'; panel.className = 'extension-settings-block';
-    panel.innerHTML = \`
+    panel.innerHTML = `
       <div class="str-head"><div><b>文字净化</b><small>规则直接替换，不调用 AI</small></div><label><input id="str-enabled" type="checkbox"> 自动净化</label></div>
       <div class="str-scope"><label for="str-scope">只处理指定标签内的正文（留空处理全部正文文本）</label><input id="str-scope" placeholder="例如 content，可填写多个标签"></div>
       <div class="str-toolbar"><button id="str-add-group" class="menu_button">新建规则合集</button><button id="str-export" class="menu_button">导出规则</button><button id="str-import" class="menu_button">导入规则</button><button id="str-clean-last" class="menu_button">净化最新楼层</button><input id="str-file" type="file" accept="application/json" hidden></div>
       <div id="str-editor" class="str-editor" hidden><b>子规则编辑</b><input id="str-name" placeholder="规则名称"><select id="str-mode"><option value="text">普通文本</option><option value="simple">简易通配（*、{A,B}）</option><option value="regex">正则表达式</option></select><textarea id="str-targets" rows="3" placeholder="匹配内容：每行一条"></textarea><textarea id="str-replacements" rows="3" placeholder="替换候选：每行一条；留空表示删除"></textarea><div class="str-editor-options"><label><input id="str-case" type="checkbox"> 区分大小写</label><button id="str-save" class="menu_button">保存子规则</button><button id="str-cancel" class="menu_button">取消</button></div><small>正则替换支持 $1、$2 捕获组；多个候选随机选择。</small></div>
-      <div id="str-groups"></div><div id="str-status" class="str-status">HTML 标签、属性、注释及代码块不会被替换。</div>\`;
+      <div id="str-groups"></div><div id="str-status" class="str-status">HTML 标签、属性、注释及代码块不会被替换。</div>`;
     host.append(panel); bindPanel(panel); renderPanel(panel);
 }
 function bindPanel(panel) {
@@ -161,7 +161,7 @@ function bindPanel(panel) {
     });
     $('#str-cancel').addEventListener('click', () => { editing = null; $('#str-editor').hidden = true; });
     $('#str-save').addEventListener('click', () => {
-        const targets = $('#str-targets').value.split(/\\r?\\n/).map(x => x.trim()).filter(Boolean);
+        const targets = $('#str-targets').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
         if (!targets.length) { $('#str-status').textContent = '请至少填写一条匹配内容。'; return; }
         const mode = $('#str-mode').value;
         if (mode === 'regex') for (const t of targets) {
@@ -173,7 +173,7 @@ function bindPanel(panel) {
         const group = settings().groups.find(g => g.id === editing.groupId); if (!group) return;
         const replacementRaw = $('#str-replacements').value;
         const next = { id: editing.ruleId || crypto.randomUUID(), name: $('#str-name').value.trim() || '未命名规则',
-            enabled: true, mode, targets, replacements: replacementRaw === '' ? [] : replacementRaw.split(/\\r?\\n/).map(x => x.replace(/\\r/g, '')),
+            enabled: true, mode, targets, replacements: replacementRaw === '' ? [] : replacementRaw.split(/\r?\n/).map(x => x.replace(/\\r/g, '')),
             flags: $('#str-case').checked ? 'gmu' : 'gimu' };
         const i = group.subRules.findIndex(r => r.id === editing.ruleId);
         if (i >= 0) group.subRules[i] = next; else group.subRules.push(next);
