@@ -163,7 +163,7 @@ function normalizePresetGroups(payload) {
         const sourceSubs = Array.isArray(group.subRules) ? group.subRules
             : Array.isArray(group.targets) ? [{ targets: group.targets, replacements: group.replacements, mode: group.mode }]
             : [];
-        const subRules = sourceSubs.map((sub, si) => {
+        const subRules = sourceSubs.filter(sub => sub && sub.rewriteMode !== 'ai').map((sub, si) => {
             if (!sub || typeof sub !== 'object') return null;
             return {
                 id: String(sub.id || crypto.randomUUID()),
