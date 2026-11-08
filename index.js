@@ -1,5 +1,3 @@
-import { extension_settings } from '../../../extensions.js';
-
 const MODULE = 'st_text_replacer';
 const DEFAULTS = {
     enabled: true,
