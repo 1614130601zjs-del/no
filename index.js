@@ -29,7 +29,7 @@ function simplePattern(source) {
     let out = '';
     for (let i = 0; i < source.length; i++) {
         const c = source[i];
-        if (c === '*') { out += '[^\\s，。！？、,.!?;；:：]{0,15}?'; continue; }
+        if (c === '*') { out += '[^，。！？、,.!?;；:：]{0,15}?'; continue; }
         if (c === '{') {
             const end = source.indexOf('}', i + 1);
             if (end > i) {
