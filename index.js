@@ -205,18 +205,37 @@ function button(label, action, id) {
     const b = document.createElement('button'); b.type = 'button'; b.className = 'menu_button';
     b.textContent = label; b.dataset.action = action; if (id) b.dataset.id = id; return b;
 }
-function mountPanel() {
-    if (document.getElementById('str-panel')) return;
-    const host = document.querySelector('#extensions_settings'); if (!host) return;
-    const panel = document.createElement('section'); panel.id = 'str-panel'; panel.className = 'extension-settings-block';
+function openPanel() {
+    const existing = document.querySelector('#str-panel');
+    if (existing) {
+        existing.closest('dialog')?.showModal?.();
+        existing.scrollIntoView({ block: 'nearest' });
+        return;
+    }
+    const { Popup, POPUP_TYPE } = getContext();
+    if (typeof Popup !== 'function' || !POPUP_TYPE) {
+        toastr.error('当前酒馆未提供弹窗接口，请更新酒馆后重试。');
+        return;
+    }
+    const panel = document.createElement('section');
+    panel.id = 'str-panel';
+    panel.className = 'extension-settings-block';
     panel.innerHTML = `
       <div class="str-head"><div><b>文字净化</b><small>规则直接替换，不调用 AI</small></div><label><input id="str-enabled" type="checkbox"> 自动净化</label></div>
       <div class="str-scope"><label for="str-scope">只处理指定标签内的正文（留空处理全部正文文本）</label><input id="str-scope" placeholder="例如 content，可填写多个标签"></div>
       <div class="str-presetbar"><label>规则预设 <select id="str-preset-select"><option value="">当前临时规则</option></select></label><button id="str-save-preset" class="menu_button">保存为预设</button><button id="str-delete-preset" class="menu_button">删除预设</button></div>
       <div class="str-toolbar"><button id="str-add-group" class="menu_button">新建规则合集</button><button id="str-export" class="menu_button">导出预设</button><button id="str-import" class="menu_button">导入预设</button><button id="str-clean-last" class="menu_button">净化最新楼层</button><input id="str-file" type="file" accept="application/json,.json" hidden></div>
       <div id="str-editor" class="str-editor" hidden><b>子规则编辑</b><input id="str-name" placeholder="规则名称"><select id="str-mode"><option value="text">普通文本</option><option value="simple">简易通配（*、{A,B}）</option><option value="regex">正则表达式</option></select><textarea id="str-targets" rows="3" placeholder="匹配内容：每行一条"></textarea><textarea id="str-replacements" rows="3" placeholder="替换候选：每行一条；留空表示删除"></textarea><div class="str-editor-options"><label><input id="str-case" type="checkbox"> 区分大小写</label><button id="str-save" class="menu_button">保存子规则</button><button id="str-cancel" class="menu_button">取消</button></div><small>正则替换支持 $1、$2 捕获组；多个候选随机选择。</small></div>
-      <div id="str-groups"></div><div id="str-status" class="str-status">HTML 标签、属性、注释及代码块不会被替换。</div>`;
-    host.append(panel); bindPanel(panel); renderPanel(panel);
+      <div id="str-groups" class="str-groups"></div><div id="str-status" class="str-status">HTML 标签、属性、注释及代码块不会被替换。</div>`;
+    bindPanel(panel);
+    renderPanel(panel);
+    const popup = new Popup(panel, POPUP_TYPE.DISPLAY, '', {
+        wide: true,
+        large: true,
+        allowVerticalScrolling: true,
+        animation: 'fast',
+    });
+    popup.show();
 }
 function bindPanel(panel) {
     const $ = s => panel.querySelector(s); let editing = null;
@@ -380,23 +399,11 @@ function mountWandEntry() {
     entry.className = 'list-group-item flex-container flexGap5';
     entry.innerHTML = '<div class="fa-solid fa-wand-magic-sparkles extensionsMenuExtensionButton"></div><span>文字净化</span>';
     entry.title = '打开文字净化规则与预设';
-    entry.addEventListener('click', () => {
-        const settingsButton = document.querySelector('#extensions_settings_button');
-        if (settingsButton) settingsButton.click();
-        const reveal = () => {
-            const panel = document.getElementById('str-panel');
-            if (panel) {
-                panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                panel.classList.add('str-panel-highlight');
-                setTimeout(() => panel.classList.remove('str-panel-highlight'), 1200);
-            }
-        };
-        requestAnimationFrame(() => requestAnimationFrame(reveal));
-    });
+    entry.addEventListener('click', openPanel);
     container.append(entry);
 }
 function initialize() {
-    settings(); mountPanel(); mountWandEntry();
+    settings(); mountWandEntry();
     const { eventSource, event_types } = getContext();
     eventSource.on(event_types.MESSAGE_RECEIVED, async messageId => {
         const ctx = getContext(), msg = ctx.chat?.[Number(messageId)], result = processMessage(msg);
