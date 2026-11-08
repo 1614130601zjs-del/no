@@ -367,19 +367,48 @@ function bindPanel(panel) {
         e.target.value = '';
     });
     $('#str-clean-last').addEventListener('click', async () => {
-        const ctx = getContext(), index = ctx.chat.length - 1, msg = ctx.chat[index];
-        if (!msg) { $('#str-status').textContent = '当前聊天没有可处理的楼层。'; return; }
-        const result = processMessage(msg, { manual: true });
-        if (result.count) {
-            if (typeof ctx.saveChat === 'function') await ctx.saveChat();
-            if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(index, msg);
-            $('#str-status').textContent = '最新楼层已替换 ' + result.count + ' 处。';
-        } else if (!result.processorCount) {
-            $('#str-status').textContent = '没有可执行的子规则：请检查合集和子规则是否启用。';
-        } else if (String(settings().scopeTags || '').trim() && !result.scopeFound) {
-            $('#str-status').textContent = '没有找到作用范围标签「' + settings().scopeTags + '」；请检查正文标签，或暂时清空作用范围测试。';
-        } else {
-            $('#str-status').textContent = '已找到处理范围，但没有匹配到规则。请检查匹配文本是否与楼层正文一致。';
+        const status = $('#str-status');
+        status.textContent = '正在检查最新楼层…';
+        try {
+            const ctx = getContext();
+            const index = Array.isArray(ctx.chat) ? ctx.chat.length - 1 : -1;
+            const msg = index >= 0 ? ctx.chat[index] : null;
+            if (!msg) {
+                status.textContent = '当前聊天没有可处理的楼层。';
+                return;
+            }
+            const originalText = msg.mes;
+            const result = processMessage(msg, { manual: true });
+            if (!result || typeof result.text !== 'string') {
+                throw new Error('规则执行没有返回有效结果');
+            }
+            if (result.count > 0 && result.text !== originalText) {
+                if (typeof ctx.updateMessageBlock !== 'function') {
+                    msg.mes = originalText;
+                    throw new Error('酒馆未提供 updateMessageBlock，无法刷新楼层');
+                }
+                ctx.updateMessageBlock(index, msg);
+                try {
+                    if (typeof ctx.saveChat === 'function') await ctx.saveChat();
+                } catch (saveError) {
+                    status.textContent = '替换已显示，但保存失败：' + (saveError?.message || saveError);
+                    if (typeof toastr !== 'undefined') toastr.error('文字已替换到当前画面，但保存聊天失败。');
+                    console.error('[文字净化] 保存聊天失败：', saveError);
+                    return;
+                }
+                status.textContent = '最新楼层已替换 ' + result.count + ' 处。';
+                if (typeof toastr !== 'undefined') toastr.success('最新楼层已替换 ' + result.count + ' 处。');
+            } else if (!result.processorCount) {
+                status.textContent = '没有可执行的子规则：请检查合集和子规则是否启用。';
+            } else if (String(settings().scopeTags || '').trim() && !result.scopeFound) {
+                status.textContent = '没有找到作用范围标签「' + settings().scopeTags + '」；请检查正文标签，或暂时清空作用范围测试。';
+            } else {
+                status.textContent = '已找到处理范围，但没有匹配到规则。请检查匹配文本是否与楼层正文一致。';
+            }
+        } catch (error) {
+            status.textContent = '净化失败：' + (error?.message || String(error));
+            if (typeof toastr !== 'undefined') toastr.error('文字净化失败：' + (error?.message || String(error)));
+            console.error('[文字净化] 手动净化失败：', error);
         }
     });
     $('#str-groups').addEventListener('click', e => {
