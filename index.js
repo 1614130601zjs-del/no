@@ -370,8 +370,33 @@ function renderPanel(panel) {
         section.append(rows); host.append(section);
     }
 }
+function mountWandEntry() {
+    if (document.getElementById('str-wand-entry')) return;
+    const container = document.querySelector('#token_counter_wand_container') ||
+        document.querySelector('#extensionsMenu');
+    if (!container) return;
+    const entry = document.createElement('div');
+    entry.id = 'str-wand-entry';
+    entry.className = 'list-group-item flex-container flexGap5';
+    entry.innerHTML = '<div class="fa-solid fa-wand-magic-sparkles extensionsMenuExtensionButton"></div><span>文字净化</span>';
+    entry.title = '打开文字净化规则与预设';
+    entry.addEventListener('click', () => {
+        const settingsButton = document.querySelector('#extensions_settings_button');
+        if (settingsButton) settingsButton.click();
+        const reveal = () => {
+            const panel = document.getElementById('str-panel');
+            if (panel) {
+                panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                panel.classList.add('str-panel-highlight');
+                setTimeout(() => panel.classList.remove('str-panel-highlight'), 1200);
+            }
+        };
+        requestAnimationFrame(() => requestAnimationFrame(reveal));
+    });
+    container.append(entry);
+}
 function initialize() {
-    settings(); mountPanel();
+    settings(); mountPanel(); mountWandEntry();
     const { eventSource, event_types } = getContext();
     eventSource.on(event_types.MESSAGE_RECEIVED, async messageId => {
         const ctx = getContext(), msg = ctx.chat?.[Number(messageId)], result = processMessage(msg);
