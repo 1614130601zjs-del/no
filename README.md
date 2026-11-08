@@ -21,7 +21,7 @@
 
 ```bash
 cd ~/SillyTavern/data/default-user/extensions
-git clone https://github.com/1614130601zjs-del/no.git
+git clone https://github.com/1614130601zjs-del/no.git st-text-replacer
 ```
 
 安装后刷新酒馆页面，在扩展设置中找到「文字净化」。
