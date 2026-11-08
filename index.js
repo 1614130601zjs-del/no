@@ -208,7 +208,6 @@ function button(label, action, id) {
 function openPanel() {
     const existing = document.querySelector('#str-panel');
     if (existing) {
-        existing.closest('dialog')?.showModal?.();
         existing.scrollIntoView({ block: 'nearest' });
         return;
     }
