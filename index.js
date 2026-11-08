@@ -100,12 +100,13 @@ function cleanHtml(html, cfg) {
     const scopes = String(cfg.scopeTags || '').toLowerCase().split(/[\s,，]+/).map(x => x.replace(/[<>/]/g, '')).filter(Boolean);
     const raw = new Set(['script', 'style', 'textarea', 'pre', 'code']);
     const stack = [];
-    let output = '', count = 0, cursor = 0;
+    let output = '', count = 0, cursor = 0, scopeFound = scopes.length === 0;
     while (cursor < source.length) {
         const open = source.indexOf('<', cursor), stop = open < 0 ? source.length : open;
         const chunk = source.slice(cursor, stop);
         const protectedBlock = stack.some(tag => raw.has(tag));
         const inScope = !scopes.length || stack.some(tag => scopes.includes(tag));
+        if (inScope && scopes.length) scopeFound = true;
         if (chunk && !protectedBlock && inScope) {
             const r = applyText(chunk, processors); output += r.text; count += r.count;
         } else output += chunk;
@@ -121,18 +122,24 @@ function cleanHtml(html, cfg) {
             const closing = !!m[1], tag = m[2].toLowerCase();
             const empty = /\/\s*>$/.test(token) || /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i.test(tag);
             if (closing) { const i = stack.lastIndexOf(tag); if (i >= 0) stack.splice(i); }
-            else if (!empty) stack.push(tag);
+            else if (!empty) {
+                stack.push(tag);
+                if (scopes.includes(tag)) scopeFound = true;
+            }
         }
         cursor = end;
     }
-    return { text: output, count };
+    return { text: output, count, scopeFound, processorCount: processors.length };
 }
-function processMessage(message) {
+function processMessage(message, { manual = false } = {}) {
     const cfg = settings();
-    if (!cfg.enabled || !message || message.is_user || message.is_system || !message.mes) return 0;
-    const r = cleanHtml(message.mes, cfg);
-    if (r.count && r.text !== message.mes) { message.mes = r.text; return r.count; }
-    return 0;
+    if (!manual && !cfg.enabled) return { count: 0, reason: 'disabled' };
+    if (!message || message.is_system || (!manual && message.is_user) || typeof message.mes !== 'string') {
+        return { count: 0, reason: 'invalid-message' };
+    }
+    const result = cleanHtml(message.mes, cfg);
+    if (result.count && result.text !== message.mes) message.mes = result.text;
+    return result;
 }
 function button(label, action, id) {
     const b = document.createElement('button'); b.type = 'button'; b.className = 'menu_button';
@@ -202,12 +209,20 @@ function bindPanel(panel) {
         e.target.value = '';
     });
     $('#str-clean-last').addEventListener('click', async () => {
-        const ctx = getContext(), index = ctx.chat.length - 1, msg = ctx.chat[index], count = processMessage(msg);
-        if (count) {
+        const ctx = getContext(), index = ctx.chat.length - 1, msg = ctx.chat[index];
+        if (!msg) { $('#str-status').textContent = '当前聊天没有可处理的楼层。'; return; }
+        const result = processMessage(msg, { manual: true });
+        if (result.count) {
             if (typeof ctx.saveChat === 'function') await ctx.saveChat();
             if (typeof ctx.updateMessageBlock === 'function') ctx.updateMessageBlock(index, msg);
-            $('#str-status').textContent = '最新楼层已替换 ' + count + ' 处。';
-        } else $('#str-status').textContent = '最新楼层没有命中规则。';
+            $('#str-status').textContent = '最新楼层已替换 ' + result.count + ' 处。';
+        } else if (!result.processorCount) {
+            $('#str-status').textContent = '没有可执行的子规则：请检查合集和子规则是否启用。';
+        } else if (String(settings().scopeTags || '').trim() && !result.scopeFound) {
+            $('#str-status').textContent = '没有找到作用范围标签「' + settings().scopeTags + '」；请检查正文标签，或暂时清空作用范围测试。';
+        } else {
+            $('#str-status').textContent = '已找到处理范围，但没有匹配到规则。请检查匹配文本是否与楼层正文一致。';
+        }
     });
     $('#str-groups').addEventListener('click', e => {
         const b = e.target.closest('button[data-action]'); if (!b) return;
@@ -269,8 +284,8 @@ function initialize() {
     settings(); mountPanel();
     const { eventSource, event_types } = getContext();
     eventSource.on(event_types.MESSAGE_RECEIVED, async messageId => {
-        const ctx = getContext(), msg = ctx.chat?.[Number(messageId)], count = processMessage(msg);
-        if (count && typeof ctx.saveChat === 'function') await ctx.saveChat();
+        const ctx = getContext(), msg = ctx.chat?.[Number(messageId)], result = processMessage(msg);
+        if (result.count && typeof ctx.saveChat === 'function') await ctx.saveChat();
     });
 }
 const { eventSource, event_types } = getContext();
