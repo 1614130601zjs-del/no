@@ -27,49 +27,97 @@ function settings() {
 function persist() { getContext().saveSettingsDebounced(); }
 function escapeRegex(value) { return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+const SIMPLE_WILDCARD_STOP_CHARS = ",，。.!?！？；;\n";
 function simplePattern(source) {
-    let out = '';
-    for (let i = 0; i < source.length; i++) {
-        const c = source[i];
-        if (c === '*') { out += '[^，。！？、,.!?;；:：]{0,15}?'; continue; }
-        if (c === '{') {
-            const end = source.indexOf('}', i + 1);
-            if (end > i) {
-                const choices = source.slice(i + 1, end).split(/[,，]/).map(x => x.trim()).filter(Boolean);
-                if (choices.length) { out += '(?:' + choices.map(escapeRegex).join('|') + ')'; i = end; continue; }
-            }
-        }
-        out += escapeRegex(c);
+    const escapedStops = SIMPLE_WILDCARD_STOP_CHARS.replace(/[.*+?^\${}()|[\]\\]/g, '\\$&');
+    return String(source ?? '')
+        .replace(/[.+^$()[\]\\]/g, '\\$&')
+        .replace(/\{([^}]+)\}/g, (match, group) => {
+            const alternatives = group.split(',').map(item => item.trim()).filter(Boolean);
+            return alternatives.length ? '(?:' + alternatives.join('|') + ')' : match;
+        })
+        .replace(/\*/g, '[^' + escapedStops + ']{0,15}?');
+}
+function findLastUnescapedSlash(text) {
+    for (let i = text.length - 1; i > 0; i--) {
+        if (text[i] !== '/') continue;
+        let backslashes = 0;
+        for (let j = i - 1; j >= 0 && text[j] === '\\'; j--) backslashes++;
+        if (backslashes % 2 === 0) return i;
     }
-    return out;
+    return -1;
+}
+function compileRegexTarget(target) {
+    const value = String(target ?? '').trim();
+    if (!value) throw new Error('规则不能为空');
+    let source = value, flags = 'gmu';
+    if (value.startsWith('/')) {
+        const last = findLastUnescapedSlash(value);
+        if (last <= 0) throw new Error('不是合法的 /pattern/flags 格式');
+        source = value.slice(1, last);
+        const rawFlags = value.slice(last + 1);
+        const allowed = new Set(['d', 'g', 'i', 'm', 's', 'u', 'v', 'y']);
+        const seen = new Set();
+        flags = '';
+        for (const flag of rawFlags) {
+            if (!allowed.has(flag)) throw new Error('包含不支持的 flags：' + flag);
+            if (seen.has(flag)) throw new Error('包含重复的 flags：' + flag);
+            seen.add(flag);
+            flags += flag;
+        }
+        if (!seen.has('g')) flags += 'g';
+    }
+    const regex = new RegExp(source, flags);
+    if (regex.test('')) throw new Error('规则会匹配空字符串');
+    return regex;
 }
 function compileSubRule(sub) {
     const mode = ['text', 'simple', 'regex'].includes(sub.mode) ? sub.mode : 'text';
     const replacements = Array.isArray(sub.replacements) ? sub.replacements.map(x => String(x ?? '')) : [];
-    const baseFlags = [...new Set(String(sub.flags || 'gimu').replace(/[^dgimsuvy]/g, '').replace(/[gy]/g, '') + 'gmu')].join('');
     const result = [];
     for (const target of (sub.targets || []).map(String).filter(Boolean).sort((a, b) => b.length - a.length)) {
         try {
-            let source = mode === 'text' ? escapeRegex(target) : mode === 'simple' ? simplePattern(target) : target;
-            let flags = baseFlags;
-            if (mode === 'regex' && target.startsWith('/')) {
-                const last = target.lastIndexOf('/');
-                if (last > 0) { source = target.slice(1, last); flags = [...new Set((target.slice(last + 1).replace(/[^dgimsuvy]/g, '') + 'g').split(''))].join(''); }
+            if (mode === 'text') {
+                result.push({ kind: 'text-entry', target, replacements });
+                continue;
             }
-            const regex = new RegExp(source, flags);
-            if (regex.test('')) throw new Error('规则会匹配空字符串');
-            result.push({ regex, replacements, target });
-        } catch (error) { console.warn('[文字净化] 跳过无效规则：', target, error); }
+            const regex = mode === 'simple'
+                ? new RegExp(simplePattern(target), 'gmu')
+                : compileRegexTarget(target);
+            result.push({ regex, replacements, target, kind: mode });
+        } catch (error) {
+            console.warn('[文字净化] 跳过无效规则：', target, error);
+        }
     }
     return result;
 }
 function buildProcessors(cfg) {
-    const out = [];
+    const processors = [];
+    const textTargets = [];
+    const textReplacements = Object.create(null);
     for (const group of cfg.groups) {
         if (group.enabled === false) continue;
-        for (const sub of group.subRules || []) if (sub && sub.enabled !== false) out.push(...compileSubRule(sub));
+        for (const sub of group.subRules || []) {
+            if (!sub || sub.enabled === false || sub.rewriteMode === 'ai') continue;
+            for (const item of compileSubRule(sub)) {
+                if (item.kind === 'text-entry') {
+                    textTargets.push(item.target);
+                    textReplacements[item.target] = item.replacements;
+                } else {
+                    processors.push(item);
+                }
+            }
+        }
     }
-    return out;
+    const uniqueTargets = [...new Set(textTargets)].sort((a, b) => b.length - a.length);
+    if (uniqueTargets.length) {
+        processors.unshift({
+            kind: 'text',
+            regex: new RegExp('(' + uniqueTargets.map(escapeRegex).join('|') + ')', 'gmu'),
+            replacerMap: textReplacements,
+        });
+    }
+    return processors;
 }
 function pickReplacement(values) {
     return values.length ? values[Math.floor(Math.random() * values.length)] : '';
@@ -82,7 +130,10 @@ function applyText(source, processors) {
     let text = source, count = 0;
     for (const p of processors) text = text.replace(p.regex, (...args) => {
         count++;
-        return replacementText(pickReplacement(p.replacements), args);
+        const match = String(args[0] ?? '');
+        const replacements = p.kind === 'text' ? p.replacerMap?.[match] : p.replacements;
+        const chosen = pickReplacement(replacements || []);
+        return p.kind === 'regex' ? replacementText(chosen, args) : chosen;
     });
     return { text, count };
 }
