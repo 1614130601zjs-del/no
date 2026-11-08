@@ -1,5 +1,5 @@
 const MODULE = 'st_text_replacer';
-const DEFAULTS = { enabled: true, scopeTags: '', groups: [] };
+const DEFAULTS = { enabled: true, scopeTags: 'content', groups: [] };
 const getContext = () => SillyTavern.getContext();
 const clone = value => JSON.parse(JSON.stringify(value));
 
