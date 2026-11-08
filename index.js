@@ -46,7 +46,7 @@ function compileSubRule(sub) {
     const replacements = Array.isArray(sub.replacements) ? sub.replacements.map(x => String(x ?? '')) : [];
     const baseFlags = [...new Set(String(sub.flags || 'gimu').replace(/[^dgimsuvy]/g, '').replace(/[gy]/g, '') + 'gmu')].join('');
     const result = [];
-    for (const target of (sub.targets || []).map(String).filter(Boolean)) {
+    for (const target of (sub.targets || []).map(String).filter(Boolean).sort((a, b) => b.length - a.length)) {
         try {
             let source = mode === 'text' ? escapeRegex(target) : mode === 'simple' ? simplePattern(target) : target;
             let flags = baseFlags;
