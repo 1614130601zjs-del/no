@@ -1,0 +1,9 @@
+{
+  "display_name": "文字净化",
+  "loading_order": 9,
+  "js": "index.js",
+  "css": "style.css",
+  "author": "1614130601zjs-del",
+  "version": "1.0.0",
+  "homePage": "https://github.com/1614130601zjs-del/no"
+}
