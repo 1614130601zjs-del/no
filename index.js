@@ -366,9 +366,13 @@ function bindPanel(panel) {
         } catch (err) { $('#str-status').textContent = '导入失败：' + err.message; }
         e.target.value = '';
     });
-    $('#str-clean-last').addEventListener('click', async () => {
+    $('#str-clean-last').addEventListener('click', async (event) => {
+        event.preventDefault();
+        event.stopPropagation();
         const status = $('#str-status');
-        status.textContent = '正在检查最新楼层…';
+        status.textContent = '已触发净化按钮，正在检查最新楼层…';
+        if (typeof toastr !== 'undefined') toastr.info('文字净化：已收到点击，正在检查最新楼层…');
+        console.info('[文字净化] 手动净化按钮已触发');
         try {
             const ctx = getContext();
             const index = Array.isArray(ctx.chat) ? ctx.chat.length - 1 : -1;
@@ -387,7 +391,9 @@ function bindPanel(panel) {
                     msg.mes = originalText;
                     throw new Error('酒馆未提供 updateMessageBlock，无法刷新楼层');
                 }
+                // SillyTavern updateMessageBlock expects the message's mesid (chat index), not the message object.
                 ctx.updateMessageBlock(index, msg);
+                console.info('[文字净化] 已调用 updateMessageBlock', { index, count: result.count });
                 try {
                     if (typeof ctx.saveChat === 'function') await ctx.saveChat();
                 } catch (saveError) {
