@@ -1,5 +1,5 @@
 const MODULE = 'st_text_replacer';
-const DEFAULTS = { enabled: true, scopeTags: 'content', groups: [] };
+const DEFAULTS = { enabled: true, scopeTags: 'content', groups: [], presets: {}, activePreset: '' };
 const getContext = () => SillyTavern.getContext();
 const clone = value => JSON.parse(JSON.stringify(value));
 
@@ -9,6 +9,8 @@ function settings() {
     const cfg = root[MODULE];
     for (const [key, value] of Object.entries(DEFAULTS)) if (!(key in cfg)) cfg[key] = clone(value);
     if (!Array.isArray(cfg.groups)) cfg.groups = [];
+    if (!cfg.presets || typeof cfg.presets !== 'object' || Array.isArray(cfg.presets)) cfg.presets = {};
+    if (typeof cfg.activePreset !== 'string') cfg.activePreset = '';
     if (Array.isArray(cfg.rules) && cfg.rules.length) {
         cfg.groups.push({
             id: crypto.randomUUID(), name: '已迁移规则', enabled: true,
@@ -141,6 +143,64 @@ function processMessage(message, { manual = false } = {}) {
     if (result.count && result.text !== message.mes) message.mes = result.text;
     return result;
 }
+
+function normalizePresetGroups(payload) {
+    let value = payload;
+    for (let i = 0; i < 3 && value && !Array.isArray(value); i++) {
+        if (Array.isArray(value.groups)) { value = value.groups; break; }
+        if (Array.isArray(value.rules)) { value = value.rules; break; }
+        if (value.__content__ !== undefined) { value = value.__content__; continue; }
+        if (value.content !== undefined) { value = value.content; continue; }
+        break;
+    }
+    if (!Array.isArray(value) && value && typeof value === 'object') {
+        const numeric = Object.keys(value).filter(k => /^\d+$/.test(k)).sort((a,b) => Number(a)-Number(b));
+        if (numeric.length) value = numeric.map(k => value[k]);
+    }
+    if (!Array.isArray(value)) throw new Error('没有找到规则合集数组（rules/groups）');
+    const groups = value.map((group, gi) => {
+        if (!group || typeof group !== 'object') return null;
+        const sourceSubs = Array.isArray(group.subRules) ? group.subRules
+            : Array.isArray(group.targets) ? [{ targets: group.targets, replacements: group.replacements, mode: group.mode }]
+            : [];
+        const subRules = sourceSubs.map((sub, si) => {
+            if (!sub || typeof sub !== 'object') return null;
+            return {
+                id: String(sub.id || crypto.randomUUID()),
+                name: String(sub.name || ('子规则 ' + (si + 1))),
+                enabled: sub.enabled !== false,
+                mode: ['text', 'simple', 'regex'].includes(sub.mode) ? sub.mode : 'text',
+                targets: Array.isArray(sub.targets) ? sub.targets.map(String).filter(Boolean) : [],
+                replacements: Array.isArray(sub.replacements) ? sub.replacements.map(v => String(v ?? '')) : [],
+                flags: sub.flags || 'gimu'
+            };
+        }).filter(Boolean);
+        return {
+            id: String(group.id || crypto.randomUUID()),
+            name: String(group.name || ('规则合集 ' + (gi + 1))),
+            enabled: group.enabled !== false,
+            subRules
+        };
+    }).filter(Boolean);
+    if (!groups.length) throw new Error('预设中没有可用的规则合集');
+    return groups;
+}
+function uniquePresetName(baseName, presets) {
+    const base = String(baseName || '').trim() || '导入预设';
+    if (!presets[base]) return base;
+    let n = 2;
+    while (presets[base + ' (' + n + ')']) n++;
+    return base + ' (' + n + ')';
+}
+function refreshPresetSelect(panel) {
+    const select = panel.querySelector('#str-preset-select');
+    if (!select) return;
+    const cfg = settings(), current = cfg.activePreset || '';
+    select.replaceChildren(new Option('当前临时规则', ''));
+    for (const name of Object.keys(cfg.presets).sort((a,b) => a.localeCompare(b))) select.add(new Option(name, name));
+    select.value = current;
+}
+
 function button(label, action, id) {
     const b = document.createElement('button'); b.type = 'button'; b.className = 'menu_button';
     b.textContent = label; b.dataset.action = action; if (id) b.dataset.id = id; return b;
@@ -152,7 +212,8 @@ function mountPanel() {
     panel.innerHTML = `
       <div class="str-head"><div><b>文字净化</b><small>规则直接替换，不调用 AI</small></div><label><input id="str-enabled" type="checkbox"> 自动净化</label></div>
       <div class="str-scope"><label for="str-scope">只处理指定标签内的正文（留空处理全部正文文本）</label><input id="str-scope" placeholder="例如 content，可填写多个标签"></div>
-      <div class="str-toolbar"><button id="str-add-group" class="menu_button">新建规则合集</button><button id="str-export" class="menu_button">导出规则</button><button id="str-import" class="menu_button">导入规则</button><button id="str-clean-last" class="menu_button">净化最新楼层</button><input id="str-file" type="file" accept="application/json" hidden></div>
+      <div class="str-presetbar"><label>规则预设 <select id="str-preset-select"><option value="">当前临时规则</option></select></label><button id="str-save-preset" class="menu_button">保存为预设</button><button id="str-delete-preset" class="menu_button">删除预设</button></div>
+      <div class="str-toolbar"><button id="str-add-group" class="menu_button">新建规则合集</button><button id="str-export" class="menu_button">导出预设</button><button id="str-import" class="menu_button">导入预设</button><button id="str-clean-last" class="menu_button">净化最新楼层</button><input id="str-file" type="file" accept="application/json,.json" hidden></div>
       <div id="str-editor" class="str-editor" hidden><b>子规则编辑</b><input id="str-name" placeholder="规则名称"><select id="str-mode"><option value="text">普通文本</option><option value="simple">简易通配（*、{A,B}）</option><option value="regex">正则表达式</option></select><textarea id="str-targets" rows="3" placeholder="匹配内容：每行一条"></textarea><textarea id="str-replacements" rows="3" placeholder="替换候选：每行一条；留空表示删除"></textarea><div class="str-editor-options"><label><input id="str-case" type="checkbox"> 区分大小写</label><button id="str-save" class="menu_button">保存子规则</button><button id="str-cancel" class="menu_button">取消</button></div><small>正则替换支持 $1、$2 捕获组；多个候选随机选择。</small></div>
       <div id="str-groups"></div><div id="str-status" class="str-status">HTML 标签、属性、注释及代码块不会被替换。</div>`;
     host.append(panel); bindPanel(panel); renderPanel(panel);
@@ -186,25 +247,53 @@ function bindPanel(panel) {
         if (i >= 0) group.subRules[i] = next; else group.subRules.push(next);
         persist(); editing = null; $('#str-editor').hidden = true; renderPanel(panel); $('#str-status').textContent = '规则已保存。';
     });
+    $('#str-preset-select').addEventListener('change', e => {
+        const cfg = settings(), name = e.target.value;
+        if (name && !cfg.presets[name]) { refreshPresetSelect(panel); return; }
+        if (cfg.activePreset && cfg.presets[cfg.activePreset] &&
+            JSON.stringify(cfg.groups) !== JSON.stringify(cfg.presets[cfg.activePreset])) {
+            if (!confirm('当前预设「' + cfg.activePreset + '」有未保存改动，切换前要保存吗？')) {
+                e.target.value = cfg.activePreset; return;
+            }
+            cfg.presets[cfg.activePreset] = clone(cfg.groups);
+        }
+        cfg.activePreset = name;
+        if (name) cfg.groups = clone(cfg.presets[name]);
+        persist(); renderPanel(panel);
+        $('#str-status').textContent = name ? ('已切换到预设「' + name + '」。') : '已切换到临时规则。';
+    });
+    $('#str-save-preset').addEventListener('click', () => {
+        const cfg = settings(), suggested = cfg.activePreset || '我的规则预设';
+        const raw = prompt('预设名称', suggested);
+        if (!raw || !raw.trim()) return;
+        const name = raw.trim();
+        if (cfg.presets[name] && name !== cfg.activePreset && !confirm('预设「' + name + '」已存在，是否覆盖？')) return;
+        cfg.presets[name] = clone(cfg.groups); cfg.activePreset = name;
+        persist(); renderPanel(panel); $('#str-status').textContent = '已保存预设「' + name + '」。';
+    });
+    $('#str-delete-preset').addEventListener('click', () => {
+        const cfg = settings(), name = cfg.activePreset;
+        if (!name || !cfg.presets[name]) { $('#str-status').textContent = '请先选择一个已保存的预设。'; return; }
+        if (!confirm('确定删除预设「' + name + '」？当前规则会保留为临时规则。')) return;
+        delete cfg.presets[name]; cfg.activePreset = '';
+        persist(); renderPanel(panel); $('#str-status').textContent = '已删除预设「' + name + '」，当前规则保留。';
+    });
     $('#str-export').addEventListener('click', () => {
-        const blob = new Blob([JSON.stringify({ version: 2, groups: settings().groups, scopeTags: settings().scopeTags }, null, 2)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob), a = document.createElement('a'); a.href = url; a.download = '文字净化规则.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+        const cfg = settings(), name = cfg.activePreset || '文字净化预设';
+        const payload = { type: 'veridis-rewrite-preset', version: 2, name, rules: clone(cfg.groups) };
+        const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob), a = document.createElement('a'); a.href = url; a.download = name + '.json'; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
     $('#str-import').addEventListener('click', () => $('#str-file').click());
     $('#str-file').addEventListener('change', async e => {
         const file = e.target.files?.[0]; if (!file) return;
         try {
-            const data = JSON.parse(await file.text()); if (!Array.isArray(data.groups)) throw new Error('文件中没有 groups 规则合集');
-            settings().groups = data.groups.filter(g => g && Array.isArray(g.subRules)).map(g => ({
-                id: g.id || crypto.randomUUID(), name: String(g.name || '导入合集'), enabled: g.enabled !== false,
-                subRules: g.subRules.filter(s => s && Array.isArray(s.targets)).map(s => ({
-                    id: s.id || crypto.randomUUID(), name: String(s.name || '未命名规则'), enabled: s.enabled !== false,
-                    mode: ['text', 'simple', 'regex'].includes(s.mode) ? s.mode : 'text',
-                    targets: s.targets.map(String), replacements: Array.isArray(s.replacements) ? s.replacements.map(String) : [], flags: s.flags || 'gimu'
-                }))
-            }));
-            if (typeof data.scopeTags === 'string') settings().scopeTags = data.scopeTags;
-            persist(); renderPanel(panel); $('#str-status').textContent = '规则合集已导入。';
+            const data = JSON.parse(await file.text()), groups = normalizePresetGroups(data), cfg = settings();
+            const baseName = data?.name || file.name.replace(/\.json$/i, '') || '导入预设';
+            const name = uniquePresetName(baseName, cfg.presets);
+            cfg.presets[name] = groups;
+            persist(); renderPanel(panel);
+            $('#str-status').textContent = '已导入「' + name + '」，共 ' + groups.length + ' 个规则合集；当前规则未被替换，可在预设列表中切换。';
         } catch (err) { $('#str-status').textContent = '导入失败：' + err.message; }
         e.target.value = '';
     });
@@ -250,6 +339,7 @@ function bindPanel(panel) {
 function renderPanel(panel) {
     const cfg = settings(); panel.querySelector('#str-enabled').checked = cfg.enabled;
     panel.querySelector('#str-scope').value = cfg.scopeTags || '';
+    refreshPresetSelect(panel);
     const host = panel.querySelector('#str-groups'); host.replaceChildren();
     if (!cfg.groups.length) { const empty = document.createElement('div'); empty.className = 'str-empty'; empty.textContent = '还没有规则合集，先新建一个合集。'; host.append(empty); return; }
     for (const group of cfg.groups) {
