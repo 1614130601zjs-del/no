@@ -1,15 +1,14 @@
 # 角色卡｜多时间线 IF
 
-这是一个 SillyTavern Character Card V2 项目，采用「精简角色卡 + 独立世界书」结构。
+这是一个 SillyTavern Character Card V2 项目，人物设定与专属世界书直接打包在同一张角色卡中。
 
 ## 文件
 
-- `character-card-v2.json`：人物核心、扮演规则、时间线隔离与关系唯一性规则。
-- `worldbook.json`：族群文明、社会结构、认主天性、历史事件及默认流亡线等详细设定。可在 SillyTavern 世界书管理器中导入，再绑定到角色。
+- `character-card-v2.json`：唯一交付文件，包含人物核心、扮演规则、时间线隔离、关系唯一性规则，以及完整的嵌入式角色世界书（`data.character_book`）。
 
 ## 设计原则
 
-角色卡负责定义「他是谁、如何行动」；世界书负责定义「他来自什么样的世界」。固定规则放在角色卡常驻指令中，详细设定按关键词触发。默认流亡线不是所有 IF 线的强制经历，条目正文也明确标注了适用条件。
+角色卡负责定义「他是谁、如何行动」；嵌入式世界书负责定义「他来自什么样的世界」。固定规则放在角色卡常驻指令中，详细设定按关键词触发。默认流亡线不是所有 IF 线的强制经历，相关条目均标注了适用条件。
 
 ## 尚待补完
 
@@ -17,8 +16,4 @@
 
 ## 导入
 
-1. 在 SillyTavern 的角色管理中导入 `character-card-v2.json`。
-2. 在世界信息（World Info）管理器中导入 `worldbook.json`。
-3. 将「角色世界书」绑定到该角色。
-
-世界书文件采用 SillyTavern 独立 World Info JSON 结构（顶层 `entries` 对象）。
+直接将 `character-card-v2.json` 导入 SillyTavern。角色卡包含嵌入式世界书；SillyTavern 导入时会提示是否导入角色附带的 World/Lorebook。确认导入即可，无需另行下载或手动绑定第二个文件。
