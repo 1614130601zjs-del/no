@@ -496,10 +496,51 @@
     }
 
     // 精简输出：按选项去掉思考块 / 草稿注释 / 绘图行，只保留正文。
-    function applyFilter(text, f) {
+    // 在代码片段之外定位闭合标签；反引号代码中的伪标签不参与判断。
+    function findClosingTagOutsideCode(text, tagName, fromIndex = 0) {
+        const source = String(text);
+        const tagRe = new RegExp("^<\\/" + tagName + "\\s*>", "i");
+        let i = Math.max(0, fromIndex);
+        while (i < source.length) {
+            if (source[i] === "\`") {
+                let runEnd = i + 1;
+                while (source[runEnd] === "\`") runEnd++;
+                const delimiter = source.slice(i, runEnd);
+                let close = runEnd, matched = -1;
+                while (close < source.length) {
+                    const tick = source.indexOf("\`", close);
+                    if (tick < 0) break;
+                    let tickEnd = tick + 1;
+                    while (source[tickEnd] === "\`") tickEnd++;
+                    if (tickEnd - tick === delimiter.length) { matched = tickEnd; break; }
+                    close = tickEnd;
+                }
+                i = matched >= 0 ? matched : runEnd;
+                continue;
+            }
+            if (source[i] === "<" && tagRe.test(source.slice(i))) return i;
+            i++;
+        }
+        return -1;
+    }
+
+    // 修复 <prelude> 边界：真正 <content> 前没有闭合时补上闭合标签。
+    function repairPreludeBoundary(text) {
         let t = String(text);
-        // <prelude> 思维块为固定过滤项，不依赖“自定义标签剔除”开关或标签列表。
-        // 从消息开头定位代码片段之外的真正 <content>，切掉此前所有思维内容。
+        const opener = t.match(/^\s*<prelude(?:\s[^>]*)?>/i);
+        if (!opener) return t;
+        const contentStart = findOpeningTagOutsideCode(t, "content", opener[0].length);
+        if (contentStart < 0) return t;
+        const closingStart = findClosingTagOutsideCode(t, "prelude", opener[0].length);
+        if (closingStart < 0 || closingStart >= contentStart) {
+            t = t.slice(0, contentStart) + "</prelude>\n" + t.slice(contentStart);
+        }
+        return t;
+    }
+
+    function applyFilter(text, f) {
+        let t = repairPreludeBoundary(String(text));
+        // 固定移除思维块：真实 content 标签作为边界，内部伪标签不影响截取。
         const preludePrefix = t.match(/^\s*<prelude(?:\s[^>]*)?>/i);
         if (preludePrefix) {
             const realContentStart = findOpeningTagOutsideCode(t, "content", preludePrefix[0].length);
