@@ -500,7 +500,7 @@
         let t = String(text);
         // <prelude> 思维块为固定过滤项，不依赖“自定义标签剔除”开关或标签列表。
         // 从消息开头定位代码片段之外的真正 <content>，切掉此前所有思维内容。
-        const preludePrefix = t.match(/^\\s*<prelude(?:\\s[^>]*)?>/i);
+        const preludePrefix = t.match(/^\s*<prelude(?:\s[^>]*)?>/i);
         if (preludePrefix) {
             const realContentStart = findOpeningTagOutsideCode(t, "content", preludePrefix[0].length);
             if (realContentStart >= 0) t = t.slice(realContentStart);
