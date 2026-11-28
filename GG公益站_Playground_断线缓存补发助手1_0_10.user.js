@@ -498,19 +498,7 @@
     // 精简输出：按选项去掉思考块 / 草稿注释 / 绘图行，只保留正文。
     function applyFilter(text, f) {
         let t = String(text);
-        if (f.thinking) {
-            // <prelude> 是消息开头的思考块；它的真实结束边界以代码片段之外的
-            // 第一个 <content> 为准，不能依赖内部可能被引用的 </prelude> 文本。
-            const prefix = t.match(/^\s*<prelude(?:\s[^>]*)?>/i);
-            if (prefix) {
-                const contentStart = findOpeningTagOutsideCode(t, "content", prefix[0].length);
-                if (contentStart >= 0) {
-                    t = t.slice(contentStart);
-                }
-                // 找不到可靠的 <content> 时保留原文，避免误删整条回复。
-            }
-            t = t.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "");
-        }
+        if (f.thinking) t = t.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "");
         if (f.imgthink) t = t.replace(/<imgthink>[\s\S]*?<\/imgthink>/gi, "");
         if (f.comments) {
             t = t.replace(/<!--[\s\S]*?-->/g, "");
@@ -523,6 +511,21 @@
                 .filter(Boolean).map(x => x.replace(/^<\/?|\/?>(?:$)/g, "").trim()).filter(Boolean);
             for (const tag of tags) {
                 const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+                // prelude 是消息最前面的思维块入口：不依赖它自己的 </prelude>，
+                // 而是跳过反引号代码片段，直接定位真正的 <content> 并整体切掉前缀。
+                if (tag.toLowerCase() === "prelude") {
+                    const prefix = t.match(/^\s*<prelude(?:\s[^>]*)?>/i);
+                    if (prefix) {
+                        const contentStart = findOpeningTagOutsideCode(t, "content", prefix[0].length);
+                        if (contentStart >= 0) {
+                            t = t.slice(contentStart);
+                            continue;
+                        }
+                        // 找不到可靠正文边界时宁可保留原文，也不冒险吞掉整条回复。
+                        continue;
+                    }
+                }
 
                 // 其他自定义标签维持原有的成对标签及断线未闭合处理。
                 const paired = new RegExp(`<${escaped}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${escaped}\\s*>`, "gi");
@@ -995,3 +998,815 @@
         const now = Date.now();
         for (const [k, v] of outRecords.entries()) {
             if (now - v.ts > REQUEST_TTL_MS) outRecords.delete(k);
+        }
+    }
+
+    // 录下 Executor 实际发给服务端的帧（含被“断线续收”丢弃的那些），回传时原样重放。
+    function recordOutFrame(rid, msg) {
+        const type = msg.type;
+        if (type !== "stream-chunk" && type !== "stream-end" && type !== "response" &&
+            type !== "error" && type !== "stream-error") return;
+        const rec = outRecords.get(rid);
+        if (!rec) return;
+        const tag = String(rid).slice(0, 8);
+        if (type === "error" || type === "stream-error") {
+            diagLog(`→ ${type} ${tag}`);
+            outRecords.delete(rid);
+            return;
+        }
+        const piece = typeof msg.chunkBody === "string" ? msg.chunkBody
+            : typeof msg.responseBody === "string" ? msg.responseBody : "";
+        if (!rec.overflow) {
+            rec.bytes += piece.length;
+            if (rec.bytes > CACHE_MAX_MEM_BYTES) {
+                rec.overflow = true;
+                rec.frames = [];
+            } else {
+                const rest = Object.assign({}, msg);
+                delete rest.requestId;
+                rec.frames.push(rest);
+            }
+        }
+        if (type === "stream-chunk") {
+            rec.chunkCount++;
+            if (rec.chunkCount === 1) diagLog(`→ stream-chunk ${tag}（首块 ${piece.length} 字）`);
+            return;
+        }
+        diagLog(`→ ${type} ${tag} status=${msg.status} 共 ${rec.frames.length} 帧 ${rec.bytes} 字`);
+        outRecords.delete(rid);
+        if (rec.overflow) return;
+        const status = Number(msg.status) || 200;
+        if (status >= 400) return;
+        let body;
+        let kind = "stream";
+        if (type === "response") {
+            if (typeof msg.responseBody !== "string") return;
+            body = msg.responseBody;
+            kind = "response";
+        } else {
+            body = rec.frames
+                .filter((f) => f.type === "stream-chunk" && typeof f.chunkBody === "string")
+                .map((f) => f.chunkBody)
+                .join("");
+        }
+        // 只缓存能解析出模型回复的响应，避免被模型列表等无关请求覆盖
+        if (!body.trim() || !extractCachedText(body).parsed) return;
+        void saveReplayCache(rec.model, body, status, { frames: rec.frames, kind });
+    }
+
+    // ==================== 1. Fetch 底层捕获（自动保存完整上游响应） ====================
+
+    function wrapFetch(fn) {
+        if (typeof fn !== "function" || fn.__pgCacheWrapped) return fn;
+        const wrapped = function (input, init) {
+            const url = typeof input === "string" ? input : (input && input.url) || "";
+            const isGenerate = url.includes(GENERATE_MATCH);
+            let reqModel = "";
+            if (isGenerate && init && typeof init.body === "string") {
+                try {
+                    const parsed = JSON.parse(init.body);
+                    if (Array.isArray(parsed) && typeof parsed[0] === "string") {
+                        reqModel = parsed[0].replace(/^models\//, "");
+                    }
+                } catch (_) {}
+            }
+
+            const promise = fn.apply(this, arguments);
+            if (isGenerate && promise && typeof promise.then === "function") {
+                promise.then((resp) => {
+                    if (!resp || !resp.ok) return;
+                    let clone;
+                    try {
+                        clone = resp.clone();
+                    } catch (_) {
+                        return;
+                    }
+                    clone.text().then((text) => {
+                        if (!text || !text.trim()) return;
+                        const activeMeta = lastRequestMeta &&
+                            (!state.replayPending || lastRequestMeta.requestId === state.replayPending.requestId)
+                            ? lastRequestMeta : null;
+                        const model = reqModel || (activeMeta && activeMeta.model) || "";
+                        void saveReplayCache(model, text, resp.status || 200);
+                    }).catch(() => {});
+                }).catch(() => {});
+            }
+            return promise;
+        };
+        wrapped.__pgCacheWrapped = true;
+        return wrapped;
+    }
+
+    // 无论本脚本与原脚本谁先注入，都确保捕获原脚本实际调用的底层 fetch
+    function ensureFetchHook() {
+        if (typeof W.fetch !== "function") return;
+        if (W.fetch.__pgOriginal) {
+            if (!W.fetch.__pgOriginal.__pgCacheWrapped) {
+                W.fetch.__pgOriginal = wrapFetch(W.fetch.__pgOriginal);
+            }
+        } else if (!W.fetch.__pgCacheWrapped) {
+            W.fetch = wrapFetch(W.fetch);
+        }
+    }
+
+    // ==================== 2. WebSocket 拦截（一键缓存补发 + 断线续收） ====================
+
+    const OrigWebSocket = W.WebSocket;
+
+    async function sendWithBackpressure(ws, origSend, payload) {
+        if (ws.readyState !== OrigWebSocket.OPEN) return false;
+        while (ws.bufferedAmount > MAX_WS_BUFFERED) {
+            if (ws.readyState !== OrigWebSocket.OPEN) return false;
+            await sleep(10);
+        }
+        if (ws.readyState !== OrigWebSocket.OPEN) return false;
+        origSend(JSON.stringify(payload));
+        return true;
+    }
+
+    async function replayToServer(ws, origSend, requestId, stream) {
+        const cache = state.replayCache;
+        if (!cache || !cache.body) return;
+        setNotice(`⚡ 正在回传缓存（${fmtBytes(cache.body.length)}）…`, "info");
+        updateUI();
+        const canUseFrames = state.preferFrames && Array.isArray(cache.frames) && cache.frames.length > 0 &&
+            (cache.kind === "stream") === !!stream;
+        diagLog(`↑ 开始回传 rid=${String(requestId).slice(0, 8)} 方式=${canUseFrames ? "原帧(" + cache.frames.length + "帧)" : "原始体"} 请求stream=${!!stream} 缓存kind=${cache.kind || "-"}`);
+        try {
+            if (canUseFrames) {
+                for (const f of cache.frames) {
+                    const ok = await sendWithBackpressure(ws, origSend, Object.assign({}, f, { requestId }));
+                    if (!ok) throw new Error("连接已断开");
+                }
+            } else if (stream) {
+                for (let i = 0; i < cache.body.length; i += STREAM_CHUNK_SIZE) {
+                    const ok = await sendWithBackpressure(ws, origSend, {
+                        type: "stream-chunk",
+                        requestId,
+                        chunkBody: cache.body.slice(i, i + STREAM_CHUNK_SIZE)
+                    });
+                    if (!ok) throw new Error("连接已断开");
+                }
+                const ok = await sendWithBackpressure(ws, origSend, {
+                    type: "stream-end",
+                    requestId,
+                    status: cache.status || 200
+                });
+                if (!ok) throw new Error("连接已断开");
+            } else {
+                const ok = await sendWithBackpressure(ws, origSend, {
+                    type: "response",
+                    requestId,
+                    status: cache.status || 200,
+                    responseBody: cache.body
+                });
+                if (!ok) throw new Error("连接已断开");
+            }
+            pendingRequests.delete(requestId);
+            diagLog("↑ 回传完成，等待服务端后续消息");
+            setNotice(`✅ 已回传缓存（${fmtBytes(cache.body.length)}，${canUseFrames ? "按原帧" : "按原始体"}），开关已自动关闭`, "ok");
+        } catch (err) {
+            diagLog("↑ 回传失败：" + ((err && err.message) || err));
+            setNotice(`❌ 回传失败：${(err && err.message) || err}（缓存已保留，可重试）`, "err");
+        }
+        updateUI();
+    }
+
+    function installWebSocketHook() {
+        if (typeof OrigWebSocket !== "function" || OrigWebSocket.__pgCacheWrapped) return;
+
+        function WrappedWebSocket(url, protocols) {
+            const ws = protocols !== undefined
+                ? new OrigWebSocket(url, protocols)
+                : new OrigWebSocket(url);
+
+            if (!WS_PATH_RE.test(String(url || ""))) {
+                return ws;
+            }
+
+            // 连接建立时再次确保底层 fetch hook 就位
+            ensureFetchHook();
+
+            const origSend = ws.send.bind(ws);
+            const origAdd = ws.addEventListener.bind(ws);
+            const origRemove = ws.removeEventListener.bind(ws);
+
+            let userOnMessage = null;
+            const extraListeners = new Set();
+
+            Object.defineProperty(ws, "onmessage", {
+                configurable: true,
+                enumerable: true,
+                get() {
+                    return userOnMessage;
+                },
+                set(fn) {
+                    userOnMessage = typeof fn === "function" ? fn : null;
+                }
+            });
+
+            ws.addEventListener = function (type, listener, options) {
+                if (type === "message" && typeof listener === "function") {
+                    extraListeners.add(listener);
+                    return;
+                }
+                return origAdd(type, listener, options);
+            };
+
+            ws.removeEventListener = function (type, listener, options) {
+                if (type === "message" && typeof listener === "function") {
+                    extraListeners.delete(listener);
+                    return;
+                }
+                return origRemove(type, listener, options);
+            };
+
+            origAdd("open", () => {
+                state.wsConnected = true;
+                updateUI();
+            });
+
+            origAdd("close", () => {
+                state.wsConnected = false;
+                updateUI();
+            });
+
+            origAdd("message", (event) => {
+                let intercepted = false;
+                if (typeof event.data === "string") {
+                    try {
+                        const msg = JSON.parse(event.data);
+                        if (msg && msg.type === "request") {
+                            prunePending();
+                            const rid = String(msg.requestId || "").trim();
+                            const stream = msg.stream === true;
+                            const model = String(msg.model || "");
+                            if (rid) {
+                                lastRequestMeta = { requestId: rid, model, stream, ts: Date.now() };
+                                diagLog(`← request ${rid.slice(0, 8)} model=${model} stream=${stream}${state.replayArmed ? " [补发已开启]" : ""}`);
+                                if (state.replayArmed && state.replayCache) {
+                                    // 在 Executor 收到 request 之前直接从 WS 回传缓存，
+                                    // 不再依赖 fetch 包装层是否被 Executor 绕过。
+                                    const cachedModel = normalizeModel(state.replayCache.model);
+                                    const requestModel = normalizeModel(model);
+                                    if (cachedModel && requestModel && cachedModel !== requestModel) {
+                                        setNotice("⚠️ 当前请求模型 " + model + " 与缓存模型 " + state.replayCache.model + " 不一致，未补发；开关仍保持开启", "warn");
+                                        trackRequest(rid, model, stream);
+                                        updateUI();
+                                    } else {
+                                        state.replayArmed = false;
+                                        intercepted = true;
+                                        setNotice("⚡ 已拦截匹配请求，正在通过 WebSocket 回传原始缓存…", "info");
+                                        updateUI();
+                                        void replayToServer(ws, origSend, rid, stream);
+                                    }
+                                } else {
+                                    trackRequest(rid, model, stream);
+                                }
+                            }
+                        } else if (msg && msg.type === "cancel") {
+                            const rid = String(msg.requestId || "").trim();
+                            diagLog(`← cancel ${rid.slice(0, 8)}${suppressedIds.has(rid) ? "（已在续收）" : ""}`);
+                            if (state.keepOnCancel && rid && pendingRequests.has(rid)) {
+                                markSuppressed(rid);
+                                intercepted = true;
+                                setNotice("⏳ 客户端已取消，后台继续接收 Google 回复以写入缓存…", "warn");
+                                updateUI();
+                            }
+                        } else if (msg && msg.type) {
+                            diagLog("← " + msg.type + " " + String(msg.requestId || "").slice(0, 8));
+                        }
+                    } catch (_) {}
+                }
+                if (intercepted) return;
+                if (userOnMessage) {
+                    try {
+                        userOnMessage.call(ws, event);
+                    } catch (_) {}
+                }
+                for (const fn of extraListeners) {
+                    try {
+                        fn.call(ws, event);
+                    } catch (_) {}
+                }
+            });
+
+            ws.send = function (data) {
+                if (typeof data === "string") {
+                    try {
+                        const msg = JSON.parse(data);
+                        const rid = String((msg && msg.requestId) || "").trim();
+                        const isTerminal = msg && (
+                            msg.type === "stream-end" ||
+                            msg.type === "response" ||
+                            msg.type === "error" ||
+                            msg.type === "stream-error"
+                        );
+                        if (rid && msg) recordOutFrame(rid, msg);
+                        if (rid && suppressedIds.has(rid)) {
+                            if (isTerminal) clearSuppressed(rid);
+                            return; // 丢弃后台续收请求的回传，避免向服务端发送已取消的包
+                        }
+                        if (rid && isTerminal) {
+                            pendingRequests.delete(rid);
+                        }
+                    } catch (_) {}
+                }
+                return origSend(data);
+            };
+
+            return ws;
+        }
+
+        WrappedWebSocket.CONNECTING = OrigWebSocket.CONNECTING;
+        WrappedWebSocket.OPEN = OrigWebSocket.OPEN;
+        WrappedWebSocket.CLOSING = OrigWebSocket.CLOSING;
+        WrappedWebSocket.CLOSED = OrigWebSocket.CLOSED;
+        WrappedWebSocket.prototype = OrigWebSocket.prototype;
+        WrappedWebSocket.__pgCacheWrapped = true;
+
+        W.WebSocket = WrappedWebSocket;
+    }
+
+    // ==================== 3. 轻量悬浮面板 UI（Shadow DOM，左下角不遮挡原面板） ====================
+
+    const CSS = `
+:host {
+  all: initial;
+  --bg: #ffffff;
+  --card: #f4f4f6;
+  --line: #dedee4;
+  --fg: #18181b;
+  --muted: #6b6b76;
+  --accent: #2563eb;
+  --accent-fg: #ffffff;
+  --ok: #15803d;
+  --warn: #b45309;
+  --err: #dc2626;
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.18);
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--fg);
+}
+@media (prefers-color-scheme: dark) {
+  :host {
+    --bg: #141418;
+    --card: #1e1e24;
+    --line: #2e2e38;
+    --fg: #f4f4f5;
+    --muted: #a1a1aa;
+    --accent: #3b82f6;
+    --accent-fg: #ffffff;
+    --ok: #4ade80;
+    --warn: #facc15;
+    --err: #f87171;
+    --shadow: 0 10px 32px rgba(0, 0, 0, 0.5);
+  }
+}
+:host([hidden]) { display: none !important; }
+*, *::before, *::after { box-sizing: border-box; }
+.box {
+  width: 270px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+.dot.ok { background: var(--ok); }
+.dot.armed { background: var(--accent); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.25); }
+.title { font-weight: 650; font-size: 12.5px; flex: 1; }
+.icon-btn {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  font-size: 14px;
+  line-height: 1;
+}
+.icon-btn:hover { background: var(--line); color: var(--fg); }
+.body {
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.meta {
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.btn {
+  flex: 1;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--fg);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) { border-color: var(--muted); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+.btn.sm {
+  flex: none;
+  padding: 0 9px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11.5px;
+  cursor: pointer;
+  user-select: none;
+}
+.check input { margin: 0; cursor: pointer; }
+.notice {
+  display: none;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--card);
+  border-left: 3px solid var(--muted);
+  font-size: 11.5px;
+  word-break: break-word;
+}
+.notice.ok { border-color: var(--ok); color: var(--ok); }
+.notice.warn { border-color: var(--warn); color: var(--warn); }
+.notice.err { border-color: var(--err); color: var(--err); }
+.notice.info { border-color: var(--accent); color: var(--fg); }
+.pill {
+  display: none;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 11px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  touch-action: none;
+}
+`;
+
+    let hostEl = null;
+    const ui = {};
+
+    function el(tag, attrs, ...kids) {
+        const node = document.createElement(tag);
+        if (attrs) {
+            for (const [k, v] of Object.entries(attrs)) {
+                if (v == null || v === false) continue;
+                if (k === "class") node.className = v;
+                else if (k === "text") node.textContent = v;
+                else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+                else node.setAttribute(k, v === true ? "" : String(v));
+            }
+        }
+        for (const kid of kids) {
+            if (kid != null) node.append(kid);
+        }
+        return node;
+    }
+
+    function setNotice(text, level = "info") {
+        state.noticeText = text;
+        state.noticeLevel = level;
+        updateUI();
+    }
+
+    function clampPos(x, y) {
+        const w = hostEl.offsetWidth || 270;
+        const h = hostEl.offsetHeight || 120;
+        const maxX = Math.max(8, W.innerWidth - w - 8);
+        const maxY = Math.max(8, W.innerHeight - h - 8);
+        return {
+            x: Math.min(Math.max(x, 8), maxX),
+            y: Math.min(Math.max(y, 8), maxY)
+        };
+    }
+
+    function applyPos(x, y) {
+        const pos = clampPos(x, y);
+        hostEl.style.left = pos.x + "px";
+        hostEl.style.top = pos.y + "px";
+        hostEl.style.right = "auto";
+        hostEl.style.bottom = "auto";
+        return pos;
+    }
+
+    function bindDrag(handle, onTap) {
+        let dragging = false;
+        let moved = false;
+        let sx = 0, sy = 0, ox = 0, oy = 0;
+
+        handle.addEventListener("pointerdown", (e) => {
+            if (e.pointerType === "mouse" && e.button !== 0) return;
+            if (e.target && e.target.closest && e.target.closest("button, input")) return;
+            dragging = true;
+            moved = false;
+            sx = e.clientX;
+            sy = e.clientY;
+            const r = hostEl.getBoundingClientRect();
+            ox = r.left;
+            oy = r.top;
+            try { handle.setPointerCapture(e.pointerId); } catch (_) {}
+            handle.style.cursor = "grabbing";
+        });
+
+        handle.addEventListener("pointermove", (e) => {
+            if (!dragging) return;
+            const dx = e.clientX - sx;
+            const dy = e.clientY - sy;
+            if (!moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+            moved = true;
+            applyPos(ox + dx, oy + dy);
+        });
+
+        const end = (e, cancelled) => {
+            if (!dragging) return;
+            dragging = false;
+            handle.style.cursor = "";
+            try { handle.releasePointerCapture(e.pointerId); } catch (_) {}
+            if (moved) {
+                const r = hostEl.getBoundingClientRect();
+                const pos = applyPos(r.left, r.top);
+                try { localStorage.setItem(STORE_KEYS.pos, JSON.stringify(pos)); } catch (_) {}
+            } else if (!cancelled && onTap) {
+                onTap();
+            }
+        };
+        handle.addEventListener("pointerup", (e) => end(e, false));
+        handle.addEventListener("pointercancel", (e) => end(e, true));
+    }
+
+    function setCollapsed(v) {
+        state.collapsed = !!v;
+        try { localStorage.setItem(STORE_KEYS.collapsed, String(state.collapsed)); } catch (_) {}
+        if (ui.box) ui.box.style.display = state.collapsed ? "none" : "block";
+        if (ui.pill) ui.pill.style.display = state.collapsed ? "flex" : "none";
+        requestAnimationFrame(() => {
+            if (!hostEl) return;
+            const r = hostEl.getBoundingClientRect();
+            applyPos(r.left, r.top);
+        });
+    }
+
+    function buildUI() {
+        if (hostEl || !isPromptsPage()) return;
+        hostEl = document.createElement("div");
+        hostEl.id = "pg-cache-companion-host";
+        hostEl.style.cssText = "position:fixed;left:20px;bottom:20px;z-index:2147483600;";
+
+        const shadow = hostEl.attachShadow({ mode: "open" });
+        const style = document.createElement("style");
+        style.textContent = CSS;
+
+        ui.pillDot = el("span", { class: "dot" });
+        ui.pillText = el("span", { text: "缓存补发" });
+        ui.pill = el("div", { class: "pill", title: "点击展开（可拖动）" }, ui.pillDot, ui.pillText);
+
+        ui.headDot = el("span", { class: "dot" });
+        const collapseBtn = el("button", {
+            class: "icon-btn",
+            type: "button",
+            title: "收起",
+            text: "–",
+            onclick: () => setCollapsed(true)
+        });
+        ui.head = el("div", { class: "head" }, ui.headDot, el("span", { class: "title", text: "⚡ 缓存补发助手" }), collapseBtn);
+
+        ui.meta = el("div", { class: "meta", text: "暂无缓存" });
+        ui.replayBtn = el("button", {
+            class: "btn",
+            type: "button",
+            text: "暂无缓存",
+            onclick: () => {
+                if (!state.replayCache) return;
+                state.replayArmed = !state.replayArmed;
+                if (state.replayArmed) {
+                    setNotice("⚡ 已开启：在酒馆点重新生成，下个请求将直接吐出缓存", "info");
+                } else {
+                    setNotice("已取消补发，恢复正常请求", "info");
+                }
+                updateUI();
+            }
+        });
+        ui.clearBtn = el("button", {
+            class: "btn sm",
+            type: "button",
+            text: "清空",
+            onclick: clearReplayCache
+        });
+        ui.diagBtn = el("button", {
+            class: "btn sm",
+            type: "button",
+            text: "诊断",
+            onclick: showDiag
+        });
+        ui.copyBtn = el("button", {
+            class: "btn",
+            type: "button",
+            text: "复制全部",
+            onclick: copyCachedText
+        });
+        ui.viewBtn = el("button", {
+            class: "btn",
+            type: "button",
+            text: "分段复制",
+            onclick: viewCachedText
+        });
+
+        ui.keepCheck = el("input", { type: "checkbox" });
+        ui.keepCheck.checked = state.keepOnCancel;
+        ui.keepCheck.addEventListener("change", () => {
+            state.keepOnCancel = ui.keepCheck.checked;
+            try { localStorage.setItem(STORE_KEYS.keepOnCancel, String(state.keepOnCancel)); } catch (_) {}
+        });
+        const keepRow = el(
+            "label",
+            {
+                class: "check",
+                title: "开启后，如果酒馆因延迟超时取消请求，本页会在后台继续把 Google 回复收完并存入缓存"
+            },
+            ui.keepCheck,
+            el("span", { text: "断线续收（酒馆超时取消时仍收完缓存）" })
+        );
+
+        ui.frameCheck = el("input", { type: "checkbox" });
+        ui.frameCheck.checked = state.preferFrames;
+        ui.frameCheck.addEventListener("change", () => {
+            state.preferFrames = ui.frameCheck.checked;
+            try { localStorage.setItem(STORE_KEYS.preferFrames, String(state.preferFrames)); } catch (_) {}
+        });
+        const frameRow = el(
+            "label",
+            {
+                class: "check",
+                title: "开启后，回传时按 Executor 当初真实发给服务端的帧原样重放（格式最稳）；关闭则把响应体自行切块回传"
+            },
+            ui.frameCheck,
+            el("span", { text: "回传时按 Executor 原帧回放（推荐）" })
+        );
+
+        ui.notice = el("div", { class: "notice" });
+
+        ui.box = el(
+            "div",
+            { class: "box" },
+            ui.head,
+            el("div", { class: "body" }, ui.meta, el("div", { class: "row" }, ui.replayBtn, ui.clearBtn, ui.diagBtn),
+                el("div", { class: "row" }, ui.copyBtn, ui.viewBtn), keepRow, frameRow, ui.notice)
+        );
+
+        shadow.append(style, ui.pill, ui.box);
+        document.documentElement.appendChild(hostEl);
+
+        bindDrag(ui.head);
+        bindDrag(ui.pill, () => setCollapsed(false));
+
+        try {
+            const savedPos = JSON.parse(localStorage.getItem(STORE_KEYS.pos) || "null");
+            if (savedPos && Number.isFinite(savedPos.x) && Number.isFinite(savedPos.y)) {
+                applyPos(savedPos.x, savedPos.y);
+            }
+        } catch (_) {}
+
+        W.addEventListener("resize", () => {
+            if (!hostEl || hostEl.hidden) return;
+            const r = hostEl.getBoundingClientRect();
+            applyPos(r.left, r.top);
+        });
+
+        setCollapsed(state.collapsed);
+        updateUI();
+        W.setInterval(updateUI, 5000); // 定期刷新缓存耗时显示
+    }
+
+    function updateUI() {
+        if (!hostEl) return;
+        const c = state.replayCache;
+
+        if (state.replayArmed) {
+            ui.headDot.className = "dot armed";
+            ui.pillDot.className = "dot armed";
+            ui.pillText.textContent = "等待补发…";
+            ui.replayBtn.disabled = false;
+            ui.replayBtn.className = "btn primary";
+            ui.replayBtn.textContent = "⚡ 已开启（点此取消）";
+        } else if (c) {
+            ui.headDot.className = "dot ok";
+            ui.pillDot.className = "dot ok";
+            ui.pillText.textContent = `已缓存 ${fmtBytes(c.body.length)}`;
+            ui.replayBtn.disabled = false;
+            ui.replayBtn.className = "btn";
+            ui.replayBtn.textContent = "⚡ 下次请求返回缓存";
+        } else {
+            ui.headDot.className = "dot";
+            ui.pillDot.className = "dot";
+            ui.pillText.textContent = "缓存补发";
+            ui.replayBtn.disabled = true;
+            ui.replayBtn.className = "btn";
+            ui.replayBtn.textContent = state.cacheLoading ? "正在读取缓存…" : "暂无缓存";
+        }
+
+        ui.clearBtn.disabled = !c;
+        ui.copyBtn.disabled = !c;
+        ui.viewBtn.disabled = !c;
+        ui.meta.textContent = c
+            ? `已缓存原始响应 ${fmtBytes(c.body.length)} · ${fmtAge(c.ts)}${c.model ? " · " + c.model : ""}${c.frames ? " · 含原帧" : ""}`
+            : state.cacheLoading
+                ? "正在读取持久化缓存…"
+                : "暂无缓存（完整收到成功响应后自动保存最新一条）";
+        if (state.cacheLoading) {
+            ui.replayBtn.disabled = true;
+            ui.clearBtn.disabled = true;
+        }
+
+        if (state.noticeText) {
+            ui.notice.style.display = "block";
+            ui.notice.className = "notice " + state.noticeLevel;
+            ui.notice.textContent = state.noticeText;
+        } else {
+            ui.notice.style.display = "none";
+        }
+    }
+
+    function syncVisibility() {
+        const visible = isPromptsPage();
+        if (visible && !hostEl && document.readyState !== "loading") buildUI();
+        if (hostEl) hostEl.hidden = !visible;
+    }
+
+    function installRouteWatch() {
+        for (const name of ["pushState", "replaceState"]) {
+            const orig = W.history[name];
+            if (typeof orig !== "function") continue;
+            W.history[name] = function (...args) {
+                const res = orig.apply(this, args);
+                syncVisibility();
+                return res;
+            };
+        }
+        W.addEventListener("popstate", syncVisibility);
+        W.addEventListener("hashchange", syncVisibility);
+        W.navigation?.addEventListener("currententrychange", syncVisibility);
+    }
+
+    // ==================== 启动 ====================
+
+    void loadPersistedState();
+    ensureFetchHook();
+    installWebSocketHook();
+    installRouteWatch();
+
+    if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", () => {
+            ensureFetchHook();
+            buildUI();
+        }, { once: true });
+    } else {
+        buildUI();
+    }
+})();
