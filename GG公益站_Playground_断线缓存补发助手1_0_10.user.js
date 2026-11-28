@@ -498,6 +498,13 @@
     // 精简输出：按选项去掉思考块 / 草稿注释 / 绘图行，只保留正文。
     function applyFilter(text, f) {
         let t = String(text);
+        // <prelude> 思维块为固定过滤项，不依赖“自定义标签剔除”开关或标签列表。
+        // 从消息开头定位代码片段之外的真正 <content>，切掉此前所有思维内容。
+        const preludePrefix = t.match(/^\\s*<prelude(?:\\s[^>]*)?>/i);
+        if (preludePrefix) {
+            const realContentStart = findOpeningTagOutsideCode(t, "content", preludePrefix[0].length);
+            if (realContentStart >= 0) t = t.slice(realContentStart);
+        }
         if (f.thinking) t = t.replace(/<thinking>[\s\S]*?<\/thinking>/gi, "");
         if (f.imgthink) t = t.replace(/<imgthink>[\s\S]*?<\/imgthink>/gi, "");
         if (f.comments) {
@@ -511,21 +518,6 @@
                 .filter(Boolean).map(x => x.replace(/^<\/?|\/?>(?:$)/g, "").trim()).filter(Boolean);
             for (const tag of tags) {
                 const escaped = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-                // prelude 是消息最前面的思维块入口：不依赖它自己的 </prelude>，
-                // 而是跳过反引号代码片段，直接定位真正的 <content> 并整体切掉前缀。
-                if (tag.toLowerCase() === "prelude") {
-                    const prefix = t.match(/^\s*<prelude(?:\s[^>]*)?>/i);
-                    if (prefix) {
-                        const contentStart = findOpeningTagOutsideCode(t, "content", prefix[0].length);
-                        if (contentStart >= 0) {
-                            t = t.slice(contentStart);
-                            continue;
-                        }
-                        // 找不到可靠正文边界时宁可保留原文，也不冒险吞掉整条回复。
-                        continue;
-                    }
-                }
 
                 // 其他自定义标签维持原有的成对标签及断线未闭合处理。
                 const paired = new RegExp(`<${escaped}(?:\\s[^>]*)?>[\\s\\S]*?<\\/${escaped}\\s*>`, "gi");
